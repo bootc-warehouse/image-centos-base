@@ -1,0 +1,34 @@
+name: Build CentOS Stream 10
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build.yml
+    with:
+      platforms: "amd64,arm64"
+      build-args: "BASE_IMAGE_TAG=stream10"
+      image-name: ghcr.io/bootc-warehouse/image-centos-base
+      image-tags: "stream10, latest"
+    secrets: inherit
+
+  test:
+    needs: build
+    uses: ./.github/workflows/_test.yml
+    with:
+      platforms: "amd64,arm64"
+      image: ${{ needs.build.outputs.image-ref }}
+      script: ./tmp/test-oci.sh
+    secrets: inherit
