@@ -1,0 +1,233 @@
+name: Build OCI
+
+on:
+  workflow_call:
+    inputs:
+      platforms:
+        required: true
+        type: string
+        description: "Comma separated list of platforms to build for"
+      build-args:
+        required: false
+        type: string
+        description: "Comma separated list of build arguments"
+      image-name:
+        required: true
+        type: string
+        description: "Name of the image to build, including the registry"
+      registry:
+        required: false
+        type: string
+        description: "URL of the registry to push the image to"
+        default: ghcr.io
+      image-tags:
+        required: false
+        type: string
+        description: "Space separated list of tags to apply to the image"
+    secrets:
+      REGISTRY_USERNAME:
+        required: false
+      REGISTRY_PASSWORD:
+        required: false
+    outputs:
+      image-ref:
+        description: The reference to the image in the registry
+        value: ${{ jobs.manifest.outputs.image-ref }}
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  generate_matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set Matrix
+        id: set-matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          # turn the comma or space separated string into a list
+          IFS=', ' read -r -a platforms <<< "${PLATFORMS}"
+          MATRIX="{\"include\":[]}"
+          for platform in "${platforms[@]}"; do
+            MATRIX=$(echo $MATRIX | jq ".include += [{\"platforms\": \"$platform\"}]")
+          done
+          echo "matrix=$(echo $MATRIX | jq -c '.')" >> $GITHUB_OUTPUT
+
+  build:
+    needs: generate_matrix
+    strategy:
+      matrix: ${{fromJson(needs.generate_matrix.outputs.matrix)}}
+    runs-on: ${{ matrix.platforms == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    container:
+      image: redhat/ubi9:latest
+      options: --privileged --volume /:/run/host:rw
+    steps:
+      - name: Install Dependencies
+        if: job.container.id != ''
+        run: |
+          dnf install -y \
+            git \
+            podman \
+            skopeo
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Login to Registry
+        env:
+          REGISTRY_URL: ${{ inputs.registry }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          # If GHCR, use the GITHUB_TOKEN and actor
+          if [ "${REGISTRY_URL}" == "ghcr.io" ]; then
+            REGISTRY_USERNAME="${{ github.actor }}"
+            REGISTRY_PASSWORD="${{ secrets.GITHUB_TOKEN }}"
+          fi
+
+          echo "${REGISTRY_PASSWORD}" | podman login --username "${REGISTRY_USERNAME}" --password-stdin "${REGISTRY_URL}"
+
+      - name: Build
+        id: build
+        env:
+          PLATFORM: ${{ matrix.platforms }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          BUILD_ARGS_FLAGS=""
+          if [ -n "${BUILD_ARGS}" ]; then
+            IFS=', ' read -r -a build_args <<< "${BUILD_ARGS}"
+            for build_arg in "${build_args[@]}"; do
+              BUILD_ARGS_FLAGS="${BUILD_ARGS_FLAGS} --build-arg ${build_arg}"
+            done
+          fi
+
+          podman build \
+            -t build:latest \
+            --platform linux/${PLATFORM} \
+            ${BUILD_ARGS_FLAGS} \
+            .
+
+          DIGEST=$(podman inspect build:latest --format '{{.Digest}}')
+          echo "DIGEST=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Push
+        id: push
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          DIGEST: ${{ steps.build.outputs.DIGEST }}
+        run: |
+          podman push \
+            --digestfile /tmp/digestfile \
+            build:latest \
+            ${IMAGE_NAME}@${DIGEST}
+
+          echo "DIGEST=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Create Job Outputs
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          PLATFORM: ${{ matrix.platforms }}
+          DIGEST: ${{ steps.push.outputs.DIGEST }}
+        run: |
+          mkdir -p /tmp/outputs/digests
+          echo "${DIGEST}" > /tmp/outputs/digests/image-${PLATFORM}.txt
+
+      - name: Upload Output Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.platforms }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            /tmp/outputs/digests/*.txt
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      image-ref: ${{ steps.push-manifest.outputs.IMAGE_REF }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Fetch Build Outputs
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          pattern: image-*
+          merge-multiple: true
+          path: /tmp/artifacts
+
+      - name: Load Outputs
+        id: load-outputs
+        run: |
+          DIGESTS_JSON=$(jq -n '{}')
+          for digest_file in /tmp/artifacts/*.txt; do
+            # Extract the platform from the file name
+            PLATFORM=$(basename $digest_file | rev | cut -d'-' -f1 | rev | cut -d'.' -f1)
+            DIGEST=$(cat $digest_file)
+            # Add the platform and digest to the JSON object
+            DIGESTS_JSON=$(echo "$DIGESTS_JSON" | jq --arg key "$PLATFORM" --arg value "$DIGEST" '. + {($key): $value}')
+          done
+          echo "DIGESTS_JSON=$(echo $DIGESTS_JSON | jq -c '.')" >> $GITHUB_OUTPUT
+          echo "PLATFORMS=$(echo $DIGESTS_JSON | jq -r 'keys | join(",")')" >> $GITHUB_OUTPUT
+
+      - name: Login to Registry
+        env:
+          REGISTRY_URL: ${{ inputs.registry }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          # If GHCR, use the GITHUB_TOKEN and actor
+          if [ "${REGISTRY_URL}" == "ghcr.io" ]; then
+            REGISTRY_USERNAME="${{ github.actor }}"
+            REGISTRY_PASSWORD="${{ secrets.GITHUB_TOKEN }}"
+          fi
+
+          echo "${REGISTRY_PASSWORD}" | podman login --username "${REGISTRY_USERNAME}" --password-stdin "${REGISTRY_URL}"
+
+      - name: Create Manifest
+        id: create-manifest
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          podman manifest create ${IMAGE_NAME}
+          echo "MANIFEST=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Populate Manifest
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          MANIFEST: ${{ steps.create-manifest.outputs.MANIFEST }}
+          DIGESTS_JSON: ${{ steps.load-outputs.outputs.DIGESTS_JSON }}
+          PLATFORMS: ${{ steps.load-outputs.outputs.PLATFORMS }}
+        run: |
+          DIGESTS=$(echo "$DIGESTS_JSON" | jq -c '.')
+          IFS=',' read -r -a PLATFORMS_ARRAY <<< "${PLATFORMS}"
+          for platform in ${PLATFORMS_ARRAY[@]}; do
+            digest=$(echo $DIGESTS | jq -r ".$platform")
+            echo "Adding ${IMAGE_NAME}@$digest for $platform"
+            podman manifest add $MANIFEST ${IMAGE_NAME}@$digest --arch $platform
+          done
+
+      - name: Push Manifest
+        id: push-manifest
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          MANIFEST: ${{ steps.create-manifest.outputs.MANIFEST }}
+          TAGS: ${{ inputs.image-tags }}
+        run: |
+          IFS=', ' read -r -a tags <<< "${TAGS}"
+
+          for tag in "${tags[@]}"; do
+            podman manifest push \
+              --all=false \
+              --digestfile /tmp/digestfile \
+              ${MANIFEST} ${IMAGE_NAME}:${tag}
+          done
+
+          DIGEST=$(cat /tmp/digestfile)
+          echo "IMAGE_REF=${IMAGE_NAME}@${DIGEST}" >> $GITHUB_OUTPUT

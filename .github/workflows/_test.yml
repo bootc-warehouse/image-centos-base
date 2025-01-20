@@ -1,0 +1,98 @@
+name: Test OCI
+
+on:
+  workflow_call:
+    inputs:
+      platforms:
+        required: true
+        type: string
+        description: "Comma separated list of platforms to test for"
+      image:
+        required: true
+        type: string
+        description: "Name of the image to test, including the registry and digest"
+      script:
+        required: false
+        type: string
+        description: "Script to run in the container"
+      registry:
+        required: false
+        type: string
+        description: "URL of the registry to push the image to"
+        default: ghcr.io
+    secrets:
+      REGISTRY_USERNAME:
+        required: false
+      REGISTRY_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+
+jobs:
+  generate_matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set Matrix
+        id: set-matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          # turn the comma or space separated string into a list
+          IFS=', ' read -r -a platforms <<< "${PLATFORMS}"
+          MATRIX="{\"include\":[]}"
+          for platform in "${platforms[@]}"; do
+            MATRIX=$(echo $MATRIX | jq ".include += [{\"platforms\": \"$platform\"}]")
+          done
+          echo "matrix=$(echo $MATRIX | jq -c '.')" >> $GITHUB_OUTPUT
+
+  test:
+    needs: generate_matrix
+    runs-on: ${{ matrix.platforms == 'amd64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{fromJson(needs.generate_matrix.outputs.matrix)}}
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            podman \
+            skopeo
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Login to Registry
+        env:
+          REGISTRY_URL: ${{ inputs.registry }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          # If GHCR, use the GITHUB_TOKEN and actor
+          if [ "${REGISTRY_URL}" == "ghcr.io" ]; then
+            REGISTRY_USERNAME="${{ github.actor }}"
+            REGISTRY_PASSWORD="${{ secrets.GITHUB_TOKEN }}"
+          fi
+
+          echo "${REGISTRY_PASSWORD}" | podman login --username "${REGISTRY_USERNAME}" --password-stdin "${REGISTRY_URL}"
+
+      - name: Pull Image
+        env:
+          IMAGE: ${{ inputs.image }}
+          PLATFORM: linux/${{ matrix.platforms }}
+        run: |
+          podman pull --platform "${PLATFORM}" "${IMAGE}"
+
+      - name: Test OCI Image
+        env:
+          SCRIPT: ${{ inputs.script }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          podman inspect "${IMAGE}"
+          podman run -v $(pwd)/:/mnt/ --rm "${IMAGE}" ls -la
+          podman run -v $(pwd)/:/mnt/ --rm "${IMAGE}" ls -la /mnt/
